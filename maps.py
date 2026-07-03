@@ -1,42 +1,29 @@
-"""
-Интеграция с картографическим сервисом 2ГИС.
-
-Используются следующие публичные API 2ГИС:
-- Geocoder API   (catalog.api.2gis.com/3.0/items/geocode)  — адрес -> координаты и обратно
-- Routing API    (routing.api.2gis.com/routing/7.0.0/global)      — маршрут авто/пешком
-- Routing API    (routing.api.2gis.com/public_transport/2.0)      — маршрут на общественном транспорте
-- Static API     (static.maps.2gis.com/2.0)                       — картинка карты с точками/маршрутом
-- Веб-ссылка на построение маршрута в 2ГИС (2gis.ru/routeSearch/...)
-
-Документация: https://docs.2gis.com/en/api/navigation/routing/overview
-"""
-
 import logging
+import re
 
 import aiohttp
 
 from config import DGIS_API_KEY
 
-GEOCODER_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
-ROUTING_URL = "https://routing.api.2gis.com/routing/7.0.0/global"
-PUBLIC_TRANSPORT_URL = "https://routing.api.2gis.com/public_transport/2.0"
-STATIC_MAP_URL = "https://static.maps.2gis.com/2.0"
+GEOCODER_URL = "https://catalog.api.2gis.com/3.0/items/geocode" # — адрес -> координаты и обратно
+ROUTING_URL = "https://routing.api.2gis.com/routing/7.0.0/global"# маршрут авто/пешком
+PUBLIC_TRANSPORT_URL = "https://routing.api.2gis.com/public_transport/2.0"# маршрут на общественном транспорте
+STATIC_MAP_URL = "https://static.maps.2gis.com/2.0"# картинка карты с точками/маршрутом
 
-# Сопоставление кнопок выбора транспорта в боте -> тип для Routing API
+#для Routing API
 TRANSPORT_MAP = {
     "🚗 На авто": "driving",
     "🚌 Общественный транспорт": "public_transport",
     "🚶 Пешком": "walking",
 }
-
-# Сопоставление кнопок выбора транспорта в боте -> тип маршрута для веб-ссылки 2ГИС
+#для веб-ссылки 2ГИС
 ROUTE_LINK_TYPE_MAP = {
     "🚗 На авто": "car",
     "🚌 Общественный транспорт": "bus",
     "🚶 Пешком": "pedestrian",
 }
 
-# Типы общественного транспорта, которые запрашиваем у 2ГИС
+# Типы общественного транспорта
 PUBLIC_TRANSPORT_TYPES = [
     "bus", "trolleybus", "tram", "shuttle_bus",
     "metro", "suburban_train", "monorail",
@@ -47,10 +34,6 @@ _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=12)
 
 
 async def geocode_address(address: str) -> tuple[float, float] | None:
-    """
-    Превращает текстовый адрес в координаты (lat, lon) через Geocoder API 2ГИС.
-    Возвращает None, если адрес не найден или произошла ошибка сети.
-    """
     params = {
         "q": address,
         "fields": "items.point",
@@ -79,11 +62,6 @@ async def geocode_address(address: str) -> tuple[float, float] | None:
 
 
 async def reverse_geocode(lat: float, lon: float) -> str | None:
-    """
-    Превращает координаты (например, из точки, отправленной на карте в Telegram)
-    в читаемый адрес через Geocoder API 2ГИС (обратное геокодирование).
-    Возвращает None, если ничего не нашлось или произошла ошибка сети.
-    """
     params = {
         "lat": lat,
         "lon": lon,
@@ -108,25 +86,122 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
     item = items[0]
     return item.get("full_name") or item.get("address_name")
 
+_LINESTRING_RE = re.compile(r"LINESTRING\(([^)]+)\)")
+
+# Максимум точек линии в ссылке на статическую карту (чтобы URL не разрастался бесконечно)
+_MAX_LINE_POINTS = 150
+
+
+def _parse_linestring_points(wkt: str) -> list[tuple[float, float]]:
+    match = _LINESTRING_RE.search(wkt or "")
+    if not match:
+        return []
+
+    points: list[tuple[float, float]] = []
+    for pair in match.group(1).split(","):
+        coords = pair.strip().split(" ")
+        if len(coords) < 2:
+            continue
+        lon_str, lat_str = coords[0], coords[1]  # третье значение (если есть) — высота, игнорируем
+        try:
+            points.append((float(lat_str), float(lon_str)))
+        except ValueError:
+            continue
+    return points
+
+
+def _simplify_points(points: list[tuple[float, float]], max_points: int = _MAX_LINE_POINTS) -> list[tuple[float, float]]:
+    if len(points) <= max_points:
+        return points
+
+    step = len(points) / max_points
+    simplified = [points[round(i * step)] for i in range(max_points - 1)]
+    simplified.append(points[-1])
+    return simplified
+
+
+async def get_route_geometry(
+    lat_from: float, lon_from: float,
+    lat_to: float, lon_to: float,
+    transport_label: str,
+) -> list[tuple[float, float]] | None:
+
+    api_transport = TRANSPORT_MAP.get(transport_label, "driving")
+    if api_transport == "public_transport":
+        return None
+
+    body = {
+        "points": [
+            {"type": "stop", "lon": lon_from, "lat": lat_from},
+            {"type": "stop", "lon": lon_to, "lat": lat_to},
+        ],
+        "transport": api_transport,
+        "route_mode": "fastest",
+        "traffic_mode": "jam" if api_transport == "driving" else "statistics",
+        "output": "detailed",
+    }
+    params = {"key": DGIS_API_KEY}
+
+    try:
+        async with aiohttp.ClientSession(timeout=_REQUEST_TIMEOUT) as session:
+            async with session.post(ROUTING_URL, params=params, json=body) as resp:
+                if resp.status != 200:
+                    logging.error(f"2ГИС Routing (geometry) вернул статус {resp.status}: {await resp.text()}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        logging.error(f"Ошибка запроса геометрии маршрута через 2ГИС: {e}")
+        return None
+
+    if isinstance(data, dict):
+        routes = data.get("result") or []
+    elif isinstance(data, list):
+        routes = data
+    else:
+        routes = []
+
+    if not routes:
+        return None
+
+    route = routes[0]
+    points: list[tuple[float, float]] = []
+
+    begin_path = ((route.get("begin_pedestrian_path") or {}).get("geometry") or {}).get("selection")
+    if begin_path:
+        points.extend(_parse_linestring_points(begin_path))
+
+    for maneuver in route.get("maneuvers") or []:
+        outcoming_path = maneuver.get("outcoming_path") or {}
+        for geometry_item in outcoming_path.get("geometry") or []:
+            points.extend(_parse_linestring_points(geometry_item.get("selection")))
+
+    end_path = ((route.get("end_pedestrian_path") or {}).get("geometry") or {}).get("selection")
+    if end_path:
+        points.extend(_parse_linestring_points(end_path))
+
+    if len(points) < 2:
+        return None
+
+    return _simplify_points(points)
+
 
 def build_static_map_url(
     dest_lat: float, dest_lon: float,
     user_lat: float | None = None, user_lon: float | None = None,
     size: str = "650x450",
+    route_points: list[tuple[float, float]] | None = None,
 ) -> str:
-    """
-    Собирает ссылку на картинку карты (Static API 2ГИС) с меткой места назначения
-    и, если известна геолокация пользователя, — линией маршрута между двумя точками.
-    """
     params = [f"s={size}"]
 
     if user_lat is not None and user_lon is not None:
-        # Точка пользователя (зелёная, №1) и точка назначения (красная, №2) + линия между ними
         params.append(f"pt={user_lat},{user_lon}~c:gn~n:1")
         params.append(f"pt={dest_lat},{dest_lon}~c:rd~n:2")
-        params.append(f"ls={user_lat},{user_lon},{dest_lat},{dest_lon}~w:5~c:2b6fdb")
+
+        if route_points and len(route_points) >= 2:
+            line_coords = ",".join(f"{lat},{lon}" for lat, lon in route_points)
+            params.append(f"ls={line_coords}~w:5~c:2b6fdb")
+        # если геометрии маршрута нет — линию не рисуем, остаются только 2 точки
     else:
-        # Известна только точка назначения — просто центрируем карту на ней
         params.append(f"pt={dest_lat},{dest_lon}~c:rd~s:l")
         params.append(f"c={dest_lat},{dest_lon}")
         params.append("z=15")
@@ -135,17 +210,27 @@ def build_static_map_url(
     return STATIC_MAP_URL + "?" + "&".join(params)
 
 
+async def build_route_static_map_url(
+    dest_lat: float, dest_lon: float,
+    user_lat: float, user_lon: float,
+    transport_label: str,
+    size: str = "650x450",
+) -> str:
+
+    route_points = await get_route_geometry(user_lat, user_lon, dest_lat, dest_lon, transport_label)
+    return build_static_map_url(
+        dest_lat, dest_lon,
+        user_lat=user_lat, user_lon=user_lon,
+        size=size,
+        route_points=route_points,
+    )
+
+
 def build_route_link(
     dest_lat: float, dest_lon: float,
     user_lat: float | None = None, user_lon: float | None = None,
     transport_label: str | None = None,
 ) -> str:
-    """
-    Собирает ссылку на 2gis.ru, которая открывает построенный маршрут
-    (в приложении 2ГИС, если оно установлено, либо в браузере).
-    Если геолокация пользователя неизвестна, точка отправления не указывается —
-    2ГИС в таком случае подставит текущее местоположение самостоятельно.
-    """
     route_type = ROUTE_LINK_TYPE_MAP.get(transport_label, "car")
     to_part = f"to/{dest_lon},{dest_lat}"
     if user_lat is not None and user_lon is not None:
@@ -160,10 +245,6 @@ async def get_travel_time_minutes(
     lat_to: float, lon_to: float,
     transport_label: str,
 ) -> int | None:
-    """
-    Возвращает предполагаемое время в пути в минутах с учётом текущей
-    ситуации на дороге, либо None при ошибке запроса к 2ГИС.
-    """
     api_transport = TRANSPORT_MAP.get(transport_label, "driving")
 
     try:
@@ -176,7 +257,6 @@ async def get_travel_time_minutes(
 
 
 async def _get_routing_time(lat_from, lon_from, lat_to, lon_to, transport: str) -> int | None:
-    """Маршрут для авто ('driving') или пешком ('walking') через Routing API."""
     body = {
         "points": [
             {"type": "stop", "lon": lon_from, "lat": lat_from},
@@ -184,7 +264,6 @@ async def _get_routing_time(lat_from, lon_from, lat_to, lon_to, transport: str) 
         ],
         "transport": transport,
         "route_mode": "fastest",
-        # Учитываем пробки в реальном времени только для авто
         "traffic_mode": "jam" if transport == "driving" else "statistics",
         "output": "summary",
     }
@@ -197,8 +276,6 @@ async def _get_routing_time(lat_from, lon_from, lat_to, lon_to, transport: str) 
                 return None
             data = await resp.json()
 
-    # Ответ 2ГИС Routing API — объект с ключом "result" (список маршрутов внутри),
-    # а не голый список, как ожидалось раньше.
     if isinstance(data, dict):
         routes = data.get("result") or []
     elif isinstance(data, list):
@@ -217,7 +294,6 @@ async def _get_routing_time(lat_from, lon_from, lat_to, lon_to, transport: str) 
 
 
 async def _get_public_transport_time(lat_from, lon_from, lat_to, lon_to) -> int | None:
-    """Маршрут на общественном транспорте через /public_transport/2.0."""
     body = {
         "source": {"point": {"lat": lat_from, "lon": lon_from}},
         "target": {"point": {"lat": lat_to, "lon": lon_to}},
@@ -233,8 +309,6 @@ async def _get_public_transport_time(lat_from, lon_from, lat_to, lon_to) -> int 
                 return None
             data = await resp.json()
 
-    # API может вернуть либо список маршрутов, либо объект с ключом "routes" —
-    # обрабатываем оба варианта на случай изменений в ответе.
     if isinstance(data, list):
         routes = data
     elif isinstance(data, dict):

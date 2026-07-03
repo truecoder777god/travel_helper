@@ -1,14 +1,11 @@
 import sqlite3
 import os
 
-# Автоматически определяем папку, в которой лежит этот файл (database.py)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Формируем абсолютный путь к файлу базы данных в этой же папке
 DB_PATH = os.path.join(BASE_DIR, 'trips.db')
 
 
 def _add_column_if_missing(cursor, table, column, definition):
-    """Добавляет колонку в таблицу, если её ещё нет (простая миграция для SQLite)."""
     cursor.execute(f"PRAGMA table_info({table})")
     existing_columns = {row[1] for row in cursor.fetchall()}
     if column not in existing_columns:
@@ -16,7 +13,6 @@ def _add_column_if_missing(cursor, table, column, definition):
 
 
 def init_db():
-    """Инициализация базы данных, создание таблиц и миграция схемы"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -42,12 +38,12 @@ def init_db():
         )
     ''')
 
-    # Миграция: последняя известная геолокация пользователя (для расчёта маршрута)
+    # последняя известная геолокация пользователя
     _add_column_if_missing(cursor, "users", "last_lat", "REAL")
     _add_column_if_missing(cursor, "users", "last_lon", "REAL")
     _add_column_if_missing(cursor, "users", "last_location_at", "TEXT")
 
-    # Миграция: геокодированные координаты места назначения поездки
+    #геокодированные координаты места назначения поездки
     _add_column_if_missing(cursor, "trips", "dest_lat", "REAL")
     _add_column_if_missing(cursor, "trips", "dest_lon", "REAL")
 
@@ -73,7 +69,6 @@ def update_user_buffer(user_id, buffer_percentage):
 
 
 def update_user_location(user_id, lat, lon):
-    """Сохраняет последнюю известную геолокацию пользователя (в т.ч. live-геолокацию)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -86,7 +81,6 @@ def update_user_location(user_id, lat, lon):
 
 
 def get_user_location(user_id):
-    """Возвращает (lat, lon) последней известной геолокации пользователя или (None, None)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT last_lat, last_lon FROM users WHERE user_id = ?', (user_id,))
@@ -122,7 +116,6 @@ def get_active_trips(user_id):
 
 
 def get_past_trips(user_id, limit=20):
-    """Прошедшие поездки пользователя (только для просмотра, без редактирования)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -169,7 +162,6 @@ def update_trip_status(trip_id, status):
 
 
 def get_trip_by_id(trip_id):
-    """Получает данные конкретной поездки по её ID"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -183,11 +175,8 @@ def get_trip_by_id(trip_id):
 
 
 def update_trip_field(trip_id, field_name, new_value):
-    """Обновляет конкретное поле поездки в БД и возвращает статус active"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    # Белый список полей для защиты от SQL-инъекций
     allowed_fields = ["destination", "arrival_time", "transport_type", "reminder_minutes", "dest_lat", "dest_lon"]
     if field_name not in allowed_fields:
         conn.close()

@@ -71,15 +71,6 @@ def get_location_request_keyboard():
 
 
 def get_destination_input_keyboard():
-    """Клавиатура для шага ввода места назначения.
-
-    Кнопки request_location в Telegram всегда отправляют реальную GPS-геопозицию
-    пользователя, а не дают выбрать произвольную точку — поэтому здесь такой
-    кнопки нет. Выбрать точку на карте можно через встроенное меню вложений
-    Telegram (см. подсказку в тексте сообщения), а обычная геолокация (если
-    пользователь действительно стоит в нужном месте) тоже подойдёт и сработает
-    точно так же.
-    """
     builder = ReplyKeyboardBuilder()
     builder.button(text="🔙 Назад")
     builder.adjust(1)
@@ -87,8 +78,6 @@ def get_destination_input_keyboard():
 
 
 async def send_route_map(user_id: int, destination: str, dest_lat, dest_lon, transport_type: str):
-    """Отправляет пользователю картинку карты с маршрутом и кнопку для открытия
-    построенного маршрута в 2ГИС. Если координат назначения нет — ничего не делает."""
     if dest_lat is None or dest_lon is None:
         return
 
@@ -102,10 +91,6 @@ async def send_route_map(user_id: int, destination: str, dest_lat, dest_lon, tra
 
     kb = InlineKeyboardBuilder()
     kb.button(text="🧭 Открыть маршрут в 2ГИС", url=route_url)
-
-    # Сами скачиваем картинку карты вместо того, чтобы отдавать голый URL в Telegram —
-    # так мы видим реальный ответ 2ГИС (в т.ч. текст ошибки), если что-то пошло не так,
-    # а не общее "failed to get HTTP URL content" от серверов Telegram.
     photo_bytes = None
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -130,8 +115,6 @@ async def send_route_map(user_id: int, destination: str, dest_lat, dest_lon, tra
         else:
             raise RuntimeError("нет байтов карты (см. лог выше)")
     except Exception as e:
-        # Например, Static API временно недоступен или не включён на ключе —
-        # не роняем сценарий, а хотя бы присылаем кнопку с маршрутом отдельно
         logging.error(f"Не удалось отправить карту пользователю {user_id}: {e}")
         try:
             await bot.send_message(
@@ -154,7 +137,6 @@ async def cmd_start(message: types.Message):
     await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
 
-# --- ГЕОЛОКАЦИЯ ---
 @dp.message(Command("location"))
 @dp.message(F.text == "📍 Геолокация")
 async def cmd_location(message: types.Message):
@@ -171,11 +153,6 @@ async def cmd_location(message: types.Message):
 
 
 async def is_not_destination_pick(message: types.Message, state: FSMContext) -> bool:
-    """Фильтр для общего обработчика геолокации: пропускает сообщение дальше
-    (возвращает False, т.е. "это не общая геолокация"), если пользователь сейчас
-    находится на шаге выбора места назначения (создание или редактирование
-    поездки) — там точку на карте нужно превратить в адрес, а не запомнить как
-    геолокацию пользователя."""
     current_state = await state.get_state()
     if current_state == TripForm.waiting_for_destination.state:
         return False
@@ -206,13 +183,10 @@ async def handle_location(message: types.Message):
 
 @dp.edited_message(F.location)
 async def handle_location_live_update(message: types.Message):
-    # Telegram присылает обновления live-геолокации как edited_message —
-    # молча обновляем координаты, не отвечая на каждое обновление
     loc = message.location
     update_user_location(message.from_user.id, loc.latitude, loc.longitude)
 
 
-# --- НАСТРОЙКИ ЧЕРЕЗ FSM ---
 @dp.message(Command("settings"))
 @dp.message(F.text == "⚙️ Настройки")
 async def cmd_settings(message: types.Message, state: FSMContext):
@@ -244,7 +218,6 @@ async def process_setting_buffer(message: types.Message, state: FSMContext):
         await message.answer("❌ Ошибка! Введи целое число процентов цифрами или нажми «🔙 Назад»:")
 
 
-# --- СЦЕНАРИЙ ДОБАВЛЕНИЯ ПОЕЗДКИ С ВАЛИДАЦИЕЙ (FSM) ---
 @dp.message(Command("add_trip"))
 @dp.message(F.text == "➕ Добавить поездку")
 async def start_trip_form(message: types.Message, state: FSMContext):
@@ -392,15 +365,12 @@ async def process_reminder(message: types.Message, state: FSMContext):
     await message.answer(summary, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
     await state.clear()
 
-    # Показываем карту с точкой (и маршрутом, если уже знаем геолокацию) + кнопку в 2ГИС
     await send_route_map(
         message.from_user.id, user_data['destination'],
         user_data.get('dest_lat'), user_data.get('dest_lon'),
         user_data['transport_type']
     )
 
-    # Если у нас ещё нет геолокации пользователя — попросим её,
-    # иначе расчёт маршрута будет только приблизительным
     user_lat, _ = get_user_location(message.from_user.id)
     if user_lat is None:
         await message.answer(
@@ -410,7 +380,6 @@ async def process_reminder(message: types.Message, state: FSMContext):
         )
 
 
-# --- СЦЕНАРИЙ ПРОСМОТРА, УДАЛЕНИЯ И РЕДАКТИРОВАНИЯ ПОЕЗДОК ---
 @dp.message(Command("my_trips"))
 @dp.message(F.text == "📅 Мои поездки")
 async def list_trips(message: types.Message):
@@ -463,7 +432,6 @@ async def process_show_trip_map(callback_query: types.CallbackQuery):
     await send_route_map(callback_query.from_user.id, destination, dest_lat, dest_lon, transport_type)
 
 
-# --- АРХИВ ПРОШЕДШИХ ПОЕЗДОК (ТОЛЬКО ПРОСМОТР) ---
 @dp.message(Command("history"))
 @dp.message(F.text == "🗂 Архив поездок")
 async def list_past_trips(message: types.Message):
@@ -507,7 +475,6 @@ async def show_field_selection_menu(message: types.Message):
     )
 
 
-# 1. Нажатие кнопки "Редактировать" под поездкой
 @dp.callback_query(lambda c: c.data.startswith("edit_"))
 async def process_edit_trip_start(callback_query: types.CallbackQuery, state: FSMContext):
     trip_id = int(callback_query.data.split("_")[1])
@@ -532,7 +499,6 @@ async def process_edit_trip_start(callback_query: types.CallbackQuery, state: FS
     await callback_query.answer()
 
 
-# Отмена редактирования
 @dp.callback_query(EditTripForm.waiting_for_field_choice, F.data == "edit_cancel")
 async def process_edit_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.message.edit_text("🚫 Редактирование отменено.")
@@ -540,7 +506,6 @@ async def process_edit_cancel(callback_query: types.CallbackQuery, state: FSMCon
     await callback_query.answer()
 
 
-# 2. Выбор поля для редактирования
 @dp.callback_query(EditTripForm.waiting_for_field_choice, F.data.startswith("field_"))
 async def process_field_choice(callback_query: types.CallbackQuery, state: FSMContext):
     chosen_field = callback_query.data.replace("field_", "")
@@ -573,7 +538,6 @@ async def process_field_choice(callback_query: types.CallbackQuery, state: FSMCo
     await callback_query.answer()
 
 
-# 3. Прием нового значения, валидация и генерация превью
 @dp.message(EditTripForm.waiting_for_new_value)
 async def process_new_value(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
@@ -642,7 +606,6 @@ async def process_new_value(message: types.Message, state: FSMContext):
             await message.answer("❌ Введи корректное целое число минут:")
             return
 
-    # ОБНОВЛЕНО: Получаем самые свежие данные для превью
     updated_data = await state.get_data()
     preview_text = (
         "📝 **Предварительный просмотр измененной поездки:**\n\n"
@@ -653,7 +616,6 @@ async def process_new_value(message: types.Message, state: FSMContext):
         "Все верно? Выбери действие ниже 👇"
     )
 
-    # ОБНОВЛЕНО: Две кнопки в один ряд (Сохранить и Продолжить редактирование)
     inline_confirm = InlineKeyboardBuilder()
     inline_confirm.row(
         types.InlineKeyboardButton(text="💾 Сохранить", callback_data="save_edit"),
@@ -664,25 +626,20 @@ async def process_new_value(message: types.Message, state: FSMContext):
     await state.set_state(EditTripForm.waiting_for_confirmation)
 
 
-# НОВОЕ: Обработчик кнопки "Изменить что-то еще"
 @dp.callback_query(EditTripForm.waiting_for_confirmation, F.data == "continue_edit")
 async def process_continue_editing(callback_query: types.CallbackQuery, state: FSMContext):
-    # Убираем старый текст превью
     await callback_query.message.delete()
-    # Заново выводим меню выбора полей
     await show_field_selection_menu(callback_query.message)
-    # Возвращаем состояние ожидания выбора поля
     await state.set_state(EditTripForm.waiting_for_field_choice)
     await callback_query.answer()
 
 
-# 4. Финальное сохранение изменений в БД
 @dp.callback_query(EditTripForm.waiting_for_confirmation, F.data == "save_edit")
 async def process_save_edit(callback_query: types.CallbackQuery, state: FSMContext):
     user_data = await state.get_data()
     trip_id = user_data['trip_id']
 
-    # Последовательно перезаписываем все поля в БД на случай множественного изменения
+
     update_trip_field(trip_id, "destination", user_data['destination'])
     update_trip_field(trip_id, "arrival_time", user_data['arrival_time'])
     update_trip_field(trip_id, "transport_type", user_data['transport_type'])
@@ -698,15 +655,12 @@ async def process_save_edit(callback_query: types.CallbackQuery, state: FSMConte
     await callback_query.answer()
 
 
-# --- ОБЩИЙ ФОЛБЭК "НАЗАД" ВНЕ FSM (например, из экрана геолокации) ---
 @dp.message(F.text == "🔙 Назад")
 async def fallback_back_to_menu(message: types.Message):
     await message.answer("Возвращаемся в главное меню.", reply_markup=get_main_menu_keyboard())
 
 
-# --- ЛОГИКА ФОНОВЫХ НАПОМИНАНИЙ ---
 def fallback_travel_estimate(transport_type: str) -> int:
-    """Грубая оценка на случай, если нет координат пользователя или 2ГИС недоступен"""
     if "авто" in transport_type.lower():
         return 20
     elif "общественн" in transport_type.lower():
@@ -715,13 +669,12 @@ def fallback_travel_estimate(transport_type: str) -> int:
         return 55
 
 
-# Кэш посчитанных маршрутов, чтобы не дёргать 2ГИС на каждой итерации планировщика (раз в 30 сек)
+
 _ROUTE_CACHE_TTL = timedelta(minutes=3)
 _route_cache: dict[int, tuple[datetime, int, bool]] = {}
 
 
 async def get_cached_travel_time(trip_id, user_lat, user_lon, dest_lat, dest_lon, transport_type):
-    """Возвращает (минуты_в_пути, является_ли_приблизительной_оценкой)"""
     now = datetime.now()
     cached = _route_cache.get(trip_id)
     if cached and now - cached[0] < _ROUTE_CACHE_TTL:
