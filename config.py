@@ -1,7 +1,6 @@
 import os
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения из файла .env, лежащего рядом с проектом
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")

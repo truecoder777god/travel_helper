@@ -91,11 +91,6 @@ def build_static_map_url(
     user_lat: float | None = None, user_lon: float | None = None,
     size: str = "650x450",
 ) -> str:
-    """
-    Строит ссылку на статическую карту 2ГИС.
-    Рисует только точки (местоположение пользователя и пункт назначения),
-    без соединяющей линии/маршрута.
-    """
     params = [f"s={size}"]
 
     if user_lat is not None and user_lon is not None:
