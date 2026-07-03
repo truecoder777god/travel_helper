@@ -1,5 +1,4 @@
 import logging
-import re
 
 import aiohttp
 
@@ -16,6 +15,7 @@ TRANSPORT_MAP = {
     "🚌 Общественный транспорт": "public_transport",
     "🚶 Пешком": "walking",
 }
+
 #для веб-ссылки 2ГИС
 ROUTE_LINK_TYPE_MAP = {
     "🚗 На авто": "car",
@@ -86,121 +86,21 @@ async def reverse_geocode(lat: float, lon: float) -> str | None:
     item = items[0]
     return item.get("full_name") or item.get("address_name")
 
-_LINESTRING_RE = re.compile(r"LINESTRING\(([^)]+)\)")
-
-# Максимум точек линии в ссылке на статическую карту (чтобы URL не разрастался бесконечно)
-_MAX_LINE_POINTS = 150
-
-
-def _parse_linestring_points(wkt: str) -> list[tuple[float, float]]:
-    match = _LINESTRING_RE.search(wkt or "")
-    if not match:
-        return []
-
-    points: list[tuple[float, float]] = []
-    for pair in match.group(1).split(","):
-        coords = pair.strip().split(" ")
-        if len(coords) < 2:
-            continue
-        lon_str, lat_str = coords[0], coords[1]  # третье значение (если есть) — высота, игнорируем
-        try:
-            points.append((float(lat_str), float(lon_str)))
-        except ValueError:
-            continue
-    return points
-
-
-def _simplify_points(points: list[tuple[float, float]], max_points: int = _MAX_LINE_POINTS) -> list[tuple[float, float]]:
-    if len(points) <= max_points:
-        return points
-
-    step = len(points) / max_points
-    simplified = [points[round(i * step)] for i in range(max_points - 1)]
-    simplified.append(points[-1])
-    return simplified
-
-
-async def get_route_geometry(
-    lat_from: float, lon_from: float,
-    lat_to: float, lon_to: float,
-    transport_label: str,
-) -> list[tuple[float, float]] | None:
-
-    api_transport = TRANSPORT_MAP.get(transport_label, "driving")
-    if api_transport == "public_transport":
-        return None
-
-    body = {
-        "points": [
-            {"type": "stop", "lon": lon_from, "lat": lat_from},
-            {"type": "stop", "lon": lon_to, "lat": lat_to},
-        ],
-        "transport": api_transport,
-        "route_mode": "fastest",
-        "traffic_mode": "jam" if api_transport == "driving" else "statistics",
-        "output": "detailed",
-    }
-    params = {"key": DGIS_API_KEY}
-
-    try:
-        async with aiohttp.ClientSession(timeout=_REQUEST_TIMEOUT) as session:
-            async with session.post(ROUTING_URL, params=params, json=body) as resp:
-                if resp.status != 200:
-                    logging.error(f"2ГИС Routing (geometry) вернул статус {resp.status}: {await resp.text()}")
-                    return None
-                data = await resp.json()
-    except Exception as e:
-        logging.error(f"Ошибка запроса геометрии маршрута через 2ГИС: {e}")
-        return None
-
-    if isinstance(data, dict):
-        routes = data.get("result") or []
-    elif isinstance(data, list):
-        routes = data
-    else:
-        routes = []
-
-    if not routes:
-        return None
-
-    route = routes[0]
-    points: list[tuple[float, float]] = []
-
-    begin_path = ((route.get("begin_pedestrian_path") or {}).get("geometry") or {}).get("selection")
-    if begin_path:
-        points.extend(_parse_linestring_points(begin_path))
-
-    for maneuver in route.get("maneuvers") or []:
-        outcoming_path = maneuver.get("outcoming_path") or {}
-        for geometry_item in outcoming_path.get("geometry") or []:
-            points.extend(_parse_linestring_points(geometry_item.get("selection")))
-
-    end_path = ((route.get("end_pedestrian_path") or {}).get("geometry") or {}).get("selection")
-    if end_path:
-        points.extend(_parse_linestring_points(end_path))
-
-    if len(points) < 2:
-        return None
-
-    return _simplify_points(points)
-
-
 def build_static_map_url(
     dest_lat: float, dest_lon: float,
     user_lat: float | None = None, user_lon: float | None = None,
     size: str = "650x450",
-    route_points: list[tuple[float, float]] | None = None,
 ) -> str:
+    """
+    Строит ссылку на статическую карту 2ГИС.
+    Рисует только точки (местоположение пользователя и пункт назначения),
+    без соединяющей линии/маршрута.
+    """
     params = [f"s={size}"]
 
     if user_lat is not None and user_lon is not None:
         params.append(f"pt={user_lat},{user_lon}~c:gn~n:1")
         params.append(f"pt={dest_lat},{dest_lon}~c:rd~n:2")
-
-        if route_points and len(route_points) >= 2:
-            line_coords = ",".join(f"{lat},{lon}" for lat, lon in route_points)
-            params.append(f"ls={line_coords}~w:5~c:2b6fdb")
-        # если геометрии маршрута нет — линию не рисуем, остаются только 2 точки
     else:
         params.append(f"pt={dest_lat},{dest_lon}~c:rd~s:l")
         params.append(f"c={dest_lat},{dest_lon}")
@@ -208,22 +108,6 @@ def build_static_map_url(
 
     params.append(f"key={DGIS_API_KEY}")
     return STATIC_MAP_URL + "?" + "&".join(params)
-
-
-async def build_route_static_map_url(
-    dest_lat: float, dest_lon: float,
-    user_lat: float, user_lon: float,
-    transport_label: str,
-    size: str = "650x450",
-) -> str:
-
-    route_points = await get_route_geometry(user_lat, user_lon, dest_lat, dest_lon, transport_label)
-    return build_static_map_url(
-        dest_lat, dest_lon,
-        user_lat=user_lat, user_lon=user_lon,
-        size=size,
-        route_points=route_points,
-    )
 
 
 def build_route_link(
